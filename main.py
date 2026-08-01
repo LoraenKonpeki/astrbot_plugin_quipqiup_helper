@@ -4,7 +4,9 @@ from astrbot.api.star import Context, Star, register
 from .solver import QuipqiupError, Solution, solve
 
 
-MAX_DISPLAYED_SOLUTIONS = 5
+MAX_DISPLAYED_SOLUTIONS = 20
+MAX_REPLY_CHARACTERS = 4000
+SUMMARY_CHARACTER_RESERVE = 40
 
 
 @register(
@@ -79,12 +81,20 @@ def _parse_arguments(message: str) -> tuple[str, str]:
 
 
 def _format_solutions(solutions: list[Solution], show_key: bool = False) -> str:
-    lines = ["quipqiup 候选结果："]
+    entries: list[str] = []
+    displayed = 0
     for index, solution in enumerate(solutions[:MAX_DISPLAYED_SOLUTIONS], start=1):
-        lines.append(f"\n{index}. {solution.plaintext}")
+        entry_lines = [f"{index}. {solution.plaintext}"]
         if show_key and solution.key:
-            lines.append("   密文：ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-            lines.append(f"   明文：{''.join(solution.key).upper()}")
-    if len(solutions) > MAX_DISPLAYED_SOLUTIONS:
-        lines.append(f"\n仅显示前 {MAX_DISPLAYED_SOLUTIONS} 条，共 {len(solutions)} 条。")
-    return "\n".join(lines)
+            entry_lines.append("   密文：ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            entry_lines.append(f"   明文：{''.join(solution.key).upper()}")
+
+        entry = "\n".join(entry_lines)
+        candidate = "\n\n".join(["quipqiup 候选结果：", *entries, entry])
+        if len(candidate) + SUMMARY_CHARACTER_RESERVE > MAX_REPLY_CHARACTERS:
+            break
+        entries.append(entry)
+        displayed += 1
+
+    result = "\n\n".join(["quipqiup 候选结果：", *entries])
+    return f"{result}\n\n已显示 {displayed} 条，共 {len(solutions)} 条。"

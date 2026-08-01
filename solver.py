@@ -9,13 +9,13 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import aiohttp
-
 
 BASE_URL = "https://www.quipqiup.com"
 REQUEST_TIMEOUT_SECONDS = 120
 MAX_POLL_INTERVAL_SECONDS = 3.0
 MAX_CONSECUTIVE_POLL_ERRORS = 8
+CURL_CONNECT_TIMEOUT_SECONDS = 10
+CURL_REQUEST_TIMEOUT_SECONDS = 30
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ class Solution:
 
 async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
     """Submit one substitution cipher and wait for quipqiup's final result."""
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     request = {
         "ciphertext": ciphertext,
@@ -48,63 +47,73 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
     }
 
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            started = await _post_json(session, f"{BASE_URL}/solve", request, headers)
+        started = await _post_json(f"{BASE_URL}/solve", request, headers)
+        request_id = started.get("id")
+        if request_id is None:
+            raise QuipqiupError("求解服务没有返回任务编号。")
 
-            request_id = started.get("id")
-            if request_id is None:
-                raise QuipqiupError("求解服务没有返回任务编号。")
+        interval = _poll_interval(started.get("poll_interval"))
+        deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+        consecutive_errors = 0
+        solutions_by_plaintext: dict[str, Solution] = {}
+        while True:
+            if time.monotonic() >= deadline:
+                raise QuipqiupError("求解超时，请稍后重试或补充已知映射。")
+            await asyncio.sleep(interval)
+            try:
+                status = await _post_json(
+                    f"{BASE_URL}/status", {"id": request_id}, headers
+                )
+                consecutive_errors = 0
+            except _RetryableQuipqiupError as exc:
+                consecutive_errors += 1
+                logger.warning("quipqiup status poll failed: %s", exc)
+                if consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
+                    raise QuipqiupError("求解服务暂时不可用，请稍后重试。") from exc
+                continue
 
-            interval = _poll_interval(started.get("poll_interval"))
-            deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
-            consecutive_errors = 0
-            solutions_by_plaintext: dict[str, Solution] = {}
-            while True:
-                await asyncio.sleep(interval)
-                try:
-                    status = await _post_json(
-                        session, f"{BASE_URL}/status", {"id": request_id}, headers
-                    )
-                    consecutive_errors = 0
-                except _RetryableQuipqiupError as exc:
-                    consecutive_errors += 1
-                    logger.warning("quipqiup status poll failed: %s", exc)
-                    if (
-                        time.monotonic() >= deadline
-                        or consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS
-                    ):
-                        raise QuipqiupError("求解服务暂时不可用，请稍后重试。") from exc
-                    continue
+            for solution in _parse_solutions(status.get("solutions", [])):
+                previous = solutions_by_plaintext.get(solution.plaintext)
+                if previous is None or _score(solution) > _score(previous):
+                    solutions_by_plaintext[solution.plaintext] = solution
 
-                for solution in _parse_solutions(status.get("solutions", [])):
-                    previous = solutions_by_plaintext.get(solution.plaintext)
-                    if previous is None or _score(solution) > _score(previous):
-                        solutions_by_plaintext[solution.plaintext] = solution
-
-                if status.get("last"):
-                    return sorted(solutions_by_plaintext.values(), key=_score, reverse=True)
-    except asyncio.TimeoutError as exc:
-        raise QuipqiupError("求解超时，请稍后重试或补充已知映射。") from exc
+            if status.get("last"):
+                return sorted(solutions_by_plaintext.values(), key=_score, reverse=True)
     except _RetryableQuipqiupError as exc:
         logger.warning("quipqiup request failed: %s", exc)
         raise QuipqiupError("求解服务暂时不可用，请稍后重试。") from exc
-    except aiohttp.ClientError as exc:
-        logger.warning("quipqiup request failed: %s", exc)
-        raise QuipqiupError("无法连接 quipqiup 求解服务。") from exc
 
 
-async def _post_json(session, url: str, payload: dict, headers: dict) -> dict:
+async def _post_json(url: str, payload: dict, headers: dict) -> dict:
     try:
-        async with session.post(url, data=json.dumps(payload), headers=headers) as response:
-            if response.status != 200:
-                body = (await response.text())[:200]
-                raise _RetryableQuipqiupError(f"HTTP {response.status}: {body}")
-            try:
-                return await response.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise _RetryableQuipqiupError("response was not valid JSON") from exc
-    except aiohttp.ClientError as exc:
+        process = await asyncio.create_subprocess_exec(
+            "curl",
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--connect-timeout",
+            str(CURL_CONNECT_TIMEOUT_SECONDS),
+            "--max-time",
+            str(CURL_REQUEST_TIMEOUT_SECONDS),
+            "-H",
+            f"Content-Type: {headers['Content-Type']}",
+            "--data-binary",
+            json.dumps(payload),
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+    except OSError as exc:
         raise _RetryableQuipqiupError(str(exc)) from exc
+
+    if process.returncode != 0:
+        detail = (stderr or stdout).decode(errors="replace").strip()[-200:]
+        raise _RetryableQuipqiupError(detail or f"curl exited {process.returncode}")
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise _RetryableQuipqiupError("response was not valid JSON") from exc
 
 
 def _poll_interval(value: Any) -> float:

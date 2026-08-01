@@ -49,11 +49,7 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{BASE_URL}/solve", data=json.dumps(request), headers=headers
-            ) as response:
-                response.raise_for_status()
-                started = await response.json()
+            started = await _post_json(session, f"{BASE_URL}/solve", request, headers)
 
             request_id = started.get("id")
             if request_id is None:
@@ -89,6 +85,9 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
                     return sorted(solutions_by_plaintext.values(), key=_score, reverse=True)
     except asyncio.TimeoutError as exc:
         raise QuipqiupError("求解超时，请稍后重试或补充已知映射。") from exc
+    except _RetryableQuipqiupError as exc:
+        logger.warning("quipqiup request failed: %s", exc)
+        raise QuipqiupError("求解服务暂时不可用，请稍后重试。") from exc
     except aiohttp.ClientError as exc:
         logger.warning("quipqiup request failed: %s", exc)
         raise QuipqiupError("无法连接 quipqiup 求解服务。") from exc

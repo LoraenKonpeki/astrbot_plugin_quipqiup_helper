@@ -20,11 +20,22 @@ class QuipqiupHelperPlugin(Star):
     @filter.command("quip", alias={"qq", "cryptogram"})
     async def quip(self, event: AstrMessageEvent):
         """求解英文单表替换密码。"""
+        async for result in self._solve_command(event, show_key=False):
+            yield result
+
+    @filter.command("quip_detail", alias={"qq_detail", "cryptogram_detail"})
+    async def quip_detail(self, event: AstrMessageEvent):
+        """求解英文单表替换密码并显示替换表。"""
+        async for result in self._solve_command(event, show_key=True):
+            yield result
+
+    async def _solve_command(self, event: AstrMessageEvent, show_key: bool):
         ciphertext, clues = _parse_arguments(event.message_str)
         if not ciphertext:
             yield event.plain_result(
                 "请输入密文。用法：/quip 密文\n"
-                "可选已知映射：/quip 密文 --clues A=E B=T"
+                "可选已知映射：/quip 密文 --clues A=E B=T\n"
+                "查看替换表：/quip_detail 密文"
             )
             return
 
@@ -42,7 +53,7 @@ class QuipqiupHelperPlugin(Star):
             yield event.plain_result("没有找到可信的结果。可以补充 `--clues A=E B=T` 后重试。")
             return
 
-        yield event.plain_result(_format_solutions(solutions))
+        yield event.plain_result(_format_solutions(solutions, show_key))
 
     @filter.command("quiphelp", alias={"qqhelp", "cryptogramhelp"})
     async def quip_help(self, event: AstrMessageEvent):
@@ -51,6 +62,7 @@ class QuipqiupHelperPlugin(Star):
             "quipqiup 单表替换求解\n\n"
             "/quip <密文>\n"
             "/quip <密文> --clues A=E B=T\n\n"
+            "/quip_detail <密文>\n\n"
             "`--clues` 左边是密文字母，右边是对应的明文字母。"
         )
 
@@ -66,11 +78,11 @@ def _parse_arguments(message: str) -> tuple[str, str]:
     return ciphertext.strip(), clues
 
 
-def _format_solutions(solutions: list[Solution]) -> str:
+def _format_solutions(solutions: list[Solution], show_key: bool = False) -> str:
     lines = ["quipqiup 候选结果："]
     for index, solution in enumerate(solutions[:MAX_DISPLAYED_SOLUTIONS], start=1):
         lines.append(f"\n{index}. {solution.plaintext}")
-        if solution.key:
+        if show_key and solution.key:
             lines.append("   密文：ABCDEFGHIJKLMNOPQRSTUVWXYZ")
             lines.append(f"   明文：{''.join(solution.key).upper()}")
     if len(solutions) > MAX_DISPLAYED_SOLUTIONS:

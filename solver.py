@@ -11,7 +11,7 @@ import aiohttp
 
 
 BASE_URL = "https://www.quipqiup.com"
-REQUEST_TIMEOUT_SECONDS = 35
+REQUEST_TIMEOUT_SECONDS = 120
 MAX_POLL_INTERVAL_SECONDS = 3.0
 
 
@@ -33,8 +33,8 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
     request = {
         "ciphertext": ciphertext,
         "clues": clues,
-        "mode": "statistics",
-        "was_auto": False,
+        "mode": "auto",
+        "was_auto": True,
         "was_clue": False,
     }
 

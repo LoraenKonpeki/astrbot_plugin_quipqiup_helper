@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,10 +15,17 @@ import aiohttp
 BASE_URL = "https://www.quipqiup.com"
 REQUEST_TIMEOUT_SECONDS = 120
 MAX_POLL_INTERVAL_SECONDS = 3.0
+MAX_CONSECUTIVE_POLL_ERRORS = 8
+
+logger = logging.getLogger(__name__)
 
 
 class QuipqiupError(Exception):
     """Raised when quipqiup cannot return a usable solving result."""
+
+
+class _RetryableQuipqiupError(Exception):
+    """A transient response failure while a task is still being processed."""
 
 
 @dataclass(frozen=True)
@@ -51,16 +60,25 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
                 raise QuipqiupError("求解服务没有返回任务编号。")
 
             interval = _poll_interval(started.get("poll_interval"))
+            deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+            consecutive_errors = 0
             solutions_by_plaintext: dict[str, Solution] = {}
             while True:
                 await asyncio.sleep(interval)
-                async with session.post(
-                    f"{BASE_URL}/status",
-                    data=json.dumps({"id": request_id}),
-                    headers=headers,
-                ) as response:
-                    response.raise_for_status()
-                    status = await response.json()
+                try:
+                    status = await _post_json(
+                        session, f"{BASE_URL}/status", {"id": request_id}, headers
+                    )
+                    consecutive_errors = 0
+                except _RetryableQuipqiupError as exc:
+                    consecutive_errors += 1
+                    logger.warning("quipqiup status poll failed: %s", exc)
+                    if (
+                        time.monotonic() >= deadline
+                        or consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS
+                    ):
+                        raise QuipqiupError("求解服务暂时不可用，请稍后重试。") from exc
+                    continue
 
                 for solution in _parse_solutions(status.get("solutions", [])):
                     previous = solutions_by_plaintext.get(solution.plaintext)
@@ -72,7 +90,22 @@ async def solve(ciphertext: str, clues: str = "") -> list[Solution]:
     except asyncio.TimeoutError as exc:
         raise QuipqiupError("求解超时，请稍后重试或补充已知映射。") from exc
     except aiohttp.ClientError as exc:
+        logger.warning("quipqiup request failed: %s", exc)
         raise QuipqiupError("无法连接 quipqiup 求解服务。") from exc
+
+
+async def _post_json(session, url: str, payload: dict, headers: dict) -> dict:
+    try:
+        async with session.post(url, data=json.dumps(payload), headers=headers) as response:
+            if response.status != 200:
+                body = (await response.text())[:200]
+                raise _RetryableQuipqiupError(f"HTTP {response.status}: {body}")
+            try:
+                return await response.json(content_type=None)
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise _RetryableQuipqiupError("response was not valid JSON") from exc
+    except aiohttp.ClientError as exc:
+        raise _RetryableQuipqiupError(str(exc)) from exc
 
 
 def _poll_interval(value: Any) -> float:
@@ -90,11 +123,12 @@ def _parse_solutions(raw_solutions: list[dict[str, Any]]) -> list[Solution]:
             continue
         raw_key = item.get("key")
         score = item.get("logp")
+        key_chars = raw_key if isinstance(raw_key, str) else raw_key
         key = (
-            tuple(raw_key)
-            if isinstance(raw_key, list)
-            and len(raw_key) == 26
-            and all(isinstance(letter, str) and len(letter) == 1 for letter in raw_key)
+            tuple(key_chars)
+            if isinstance(key_chars, (str, list))
+            and len(key_chars) == 26
+            and all(isinstance(letter, str) and len(letter) == 1 for letter in key_chars)
             else None
         )
         solutions.append(
